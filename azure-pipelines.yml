@@ -1,0 +1,97 @@
+trigger: none
+pr: none
+
+schedules:
+  - cron: "0 3 * * 1"
+    displayName: Weekly collector update
+    branches:
+      include:
+        - main
+    always: true
+
+parameters:
+  - name: poolName
+    displayName: Self-hosted Windows agent pool
+    type: string
+    default: BloodHound-Sensors
+  - name: checkOnly
+    displayName: Check without installing
+    type: boolean
+    default: false
+  - name: targets
+    type: object
+    default:
+      - id: configure_me
+        agentName: REPLACE-WITH-AGENT-NAME
+        collectors: SharpHound,AzureHound
+        sharpHoundPath: ""
+        azureHoundPath: 'C:\Program Files\AzureHound Enterprise\azurehound.exe'
+
+jobs:
+  - ${{ each target in parameters.targets }}:
+      - job: update_${{ target.id }}
+        displayName: Update collectors on ${{ target.agentName }}
+        timeoutInMinutes: 20
+        pool:
+          name: ${{ parameters.poolName }}
+          demands:
+            - Agent.Name -equals ${{ target.agentName }}
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: PowerShell@2
+            displayName: Check and update BloodHound collectors
+            inputs:
+              pwsh: false
+              targetType: inline
+              script: |
+                $ErrorActionPreference = 'Stop'
+                try {
+                    $params = @{
+                        BloodHoundUrl = $env:BHE_URL
+                        Collectors = @(
+                            '${{ target.collectors }}' -split '\s*,\s*' |
+                                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                        )
+                        CheckOnly = [bool]::Parse('${{ parameters.checkOnly }}')
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace('${{ target.sharpHoundPath }}')) {
+                        $params.SharpHoundPath = '${{ target.sharpHoundPath }}'
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace('${{ target.azureHoundPath }}')) {
+                        $params.AzureHoundPath = '${{ target.azureHoundPath }}'
+                    }
+
+                    $resultPath = "$(Agent.TempDirectory)\collector-update-result.json"
+                    $result = & "$(Build.SourcesDirectory)\Update-BloodHoundCollectors.ps1" `
+                        @params `
+                        -ResultPath $resultPath
+                    $result | Format-Table -AutoSize
+                }
+                catch {
+                    $resultPath = "$(Agent.TempDirectory)\collector-update-result.json"
+                    if (-not (Test-Path -LiteralPath $resultPath)) {
+                        [pscustomobject]@{
+                            status = 'Failed'
+                            message = $_.Exception.Message
+                            server = $env:COMPUTERNAME
+                            timestamp_utc = [DateTime]::UtcNow.ToString('o')
+                        } | ConvertTo-Json |
+                            Set-Content -LiteralPath $resultPath -Encoding UTF8
+                    }
+                    throw
+                }
+            env:
+              BHE_URL: $(BHE_URL)
+              BHE_TOKEN_ID: $(BHE_TOKEN_ID)
+              BHE_TOKEN_KEY: $(BHE_TOKEN_KEY)
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish update result
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: '$(Agent.TempDirectory)\collector-update-result.json'
+              artifact: collector-update-${{ target.id }}-$(System.JobAttempt)
